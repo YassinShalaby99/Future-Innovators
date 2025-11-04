@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (keep the folder, ignore files)
+data/*
+!data/.gitkeep
+
+# Parquet/CSV anywhere (safety)
+*.parquet
+*.csv

@@ -1,0 +1,6 @@
+streamlit>=1.32
+pandas>=2.0
+numpy>=1.24
+pyarrow>=10.0
+requests>=2.31
+azure-storage-blob>=12.19  # only needed if you choose SDK auth later
