@@ -5,70 +5,237 @@ import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
+from io import BytesIO
+from datetime import datetime
+import pyarrow.parquet as pq
+from typing import Tuple, Optional
 
-st.set_page_config(page_title="Traffic Simulation Dashboard", layout="wide")
-st.title("🚦 Real-Time Traffic Simulation")
+# Optional import (only used if you provide account+key secrets)
+try:
+    from azure.storage.blob import BlobServiceClient
+    _AZURE_AVAILABLE = True
+except Exception:
+    _AZURE_AVAILABLE = False
 
-# --- Data source selection ---
-# If DATA_URL is set via Streamlit Secrets (or env), we load from Azure.
-# Otherwise we load from a local path (dev mode).
-DATA_URL = os.getenv("DATA_URL", st.secrets.get("DATA_URL", ""))
 
-# Sidebar controls
-dev_path = st.sidebar.text_input("Processed path (dev only)", "data/traffic_with_time.csv")
-speed_mult = st.sidebar.selectbox("Playback speed", [1, 2, 5, 10], index=1)
-window_minutes = st.sidebar.slider("Visible window (minutes)", 5, 120, 30, 5)
+# ===== PAGE CONFIGURATION =====
+st.set_page_config(
+    page_title="Traffic Simulation Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# --- Data loading helpers ---
-@st.cache_data(show_spinner="Loading dataset...")
+# ===== STYLING =====
+st.markdown("""
+    <style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        margin-bottom: 0.5rem;
+    }
+    .metric-container {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+st.markdown('<p class="main-header">🚦 Real-Time Traffic Simulation</p>', unsafe_allow_html=True)
+
+
+# ===== DATA LOADING HELPERS =====
+@st.cache_data(show_spinner="Loading dataset from Azure Blob Storage...", ttl=600)
+def _read_from_azure_blob(account: str, key: str, container: str, blob: str) -> pd.DataFrame:
+    """
+    Uses account+key to read a blob (CSV or Parquet) from Azure.
+    This is the PREFERRED method for production deployments.
+    """
+    if not _AZURE_AVAILABLE:
+        raise RuntimeError("azure-storage-blob not installed. Add it to requirements.txt")
+
+    try:
+        svc = BlobServiceClient(
+            account_url=f"https://{account}.blob.core.windows.net",
+            credential=key
+        )
+        client = svc.get_blob_client(container=container, blob=blob)
+        
+        # Download blob data
+        data = client.download_blob().readall()
+        buf = BytesIO(data)
+
+        # Parse based on file extension
+        if blob.lower().endswith(".parquet"):
+            df = pq.read_table(buf).to_pandas()
+        else:
+            df = pd.read_csv(buf, parse_dates=["timestamp"])
+
+        return df
+    except Exception as e:
+        raise RuntimeError(f"Failed to read from Azure Blob Storage: {str(e)}")
+
+
+@st.cache_data(show_spinner="Loading dataset from SAS URL...", ttl=600)
 def _read_from_url(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    content = io.BytesIO(r.content)
-    if url.lower().endswith(".parquet"):
-        df = pd.read_parquet(content)
-    else:
-        df = pd.read_csv(content, parse_dates=["timestamp"])
-    return df
+    """
+    Fallback method: Works with CSV or Parquet over HTTPS (SAS URL)
+    """
+    try:
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        content = io.BytesIO(r.content)
+        
+        if url.lower().endswith(".parquet"):
+            df = pd.read_parquet(content)
+        else:
+            df = pd.read_csv(content, parse_dates=["timestamp"])
+        return df
+    except Exception as e:
+        raise RuntimeError(f"Failed to read from SAS URL: {str(e)}")
 
-@st.cache_data(show_spinner="Loading dataset...")
+
+@st.cache_data(show_spinner="Loading local dataset...", ttl=600)
 def _read_local(path: str) -> pd.DataFrame:
+    """
+    Local development fallback
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Local file not found: {path}")
+    
     if path.lower().endswith(".parquet"):
         df = pd.read_parquet(path)
     else:
         df = pd.read_csv(path, parse_dates=["timestamp"])
     return df
 
-def load_df(local_path: str, url: str) -> pd.DataFrame:
-    if url:
-        src = "Azure (SAS URL)"
-        df = _read_from_url(url)
-    else:
-        src = f"Local file: {local_path}"
-        df = _read_local(local_path)
 
-    # Ensure sorted by time and clean index to avoid KeyError on .loc
+def _normalize_timestamp(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures timestamp column exists and is properly formatted
+    """
     if "timestamp" not in df.columns:
         raise ValueError("Expected a 'timestamp' column in the dataset.")
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    return df, src
+    
+    # Ensure proper dtype
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=False)
+    
+    # Remove invalid timestamps and sort
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    
+    return df
 
-# --- Load the data (Azure preferred, local fallback) ---
+
+def load_df() -> Tuple[pd.DataFrame, str]:
+    """
+    Load data with priority:
+    1) Azure Blob Storage (account + key) - PREFERRED
+    2) SAS URL (fallback)
+    3) Local file (development only)
+    """
+    # Priority 1: Azure Blob Storage with account key (PREFERRED)
+    az_keys = ("AZURE_STORAGE_ACCOUNT", "AZURE_STORAGE_KEY", "AZURE_CONTAINER", "AZURE_BLOB")
+    if all(k in st.secrets for k in az_keys):
+        account = st.secrets["AZURE_STORAGE_ACCOUNT"]
+        key = st.secrets["AZURE_STORAGE_KEY"]
+        container = st.secrets["AZURE_CONTAINER"]
+        blob = st.secrets["AZURE_BLOB"]
+        
+        df = _read_from_azure_blob(account, key, container, blob)
+        return _normalize_timestamp(df), f"Azure Blob Storage ({account}/{container}/{blob})"
+    
+    # Priority 2: SAS URL (fallback)
+    sas_url = os.getenv("DATA_URL", st.secrets.get("DATA_URL", ""))
+    if sas_url:
+        df = _read_from_url(sas_url)
+        return _normalize_timestamp(df), "Azure (SAS URL)"
+    
+    # Priority 3: Local file (development)
+    dev_path = st.secrets.get("LOCAL_DEV_PATH", "data/traffic_with_time.csv")
+    if os.path.exists(dev_path):
+        df = _read_local(dev_path)
+        return _normalize_timestamp(df), f"Local file: {dev_path}"
+    
+    raise RuntimeError("No valid data source found. Please configure Azure credentials in Streamlit secrets.")
+
+
+# ===== SIDEBAR CONTROLS =====
+st.sidebar.header("⚙️ Control Panel")
+
+# Playback settings
+st.sidebar.subheader("Playback Settings")
+speed_mult = st.sidebar.selectbox(
+    "Playback Speed",
+    options=[1, 2, 5, 10, 20],
+    index=1,
+    help="Multiplier for playback speed"
+)
+
+window_minutes = st.sidebar.slider(
+    "Visible Window (minutes)",
+    min_value=5,
+    max_value=120,
+    value=30,
+    step=5,
+    help="Time window to display in charts"
+)
+
+auto_refresh = st.sidebar.checkbox(
+    "Auto-refresh",
+    value=True,
+    help="Automatically advance through the timeline"
+)
+
+
+# ===== LOAD DATA =====
 try:
-    df, source_label = load_df(dev_path, DATA_URL)
-    st.caption(f"Data source: **{source_label}**")
+    df, source_label = load_df()
+    st.sidebar.success(f"✅ **Data Source:** {source_label}")
+    st.sidebar.metric("Total Records", f"{len(df):,}")
+    
+    if len(df) > 0:
+        time_range = df["timestamp"].max() - df["timestamp"].min()
+        st.sidebar.metric("Time Span", f"{time_range.days}d {time_range.seconds//3600}h")
+    
 except Exception as e:
-    st.error(f"❌ Failed to load data: {e}")
+    st.error(f"❌ **Failed to load data:** {e}")
+    st.info("Please ensure your Azure credentials are configured in Streamlit secrets.")
     st.stop()
 
-# --- Filters (only apply if columns exist) ---
+
+# ===== FILTERS =====
+st.sidebar.subheader("🔍 Filters")
+
 def _safe_unique(series_name: str):
-    return sorted(df[series_name].dropna().unique().tolist()) if series_name in df.columns else []
+    """Safely get unique values from a column"""
+    if series_name in df.columns:
+        return sorted(df[series_name].dropna().unique().tolist())
+    return []
 
-cities = st.sidebar.multiselect("Cities", _safe_unique("City"))
-vehicles = st.sidebar.multiselect("Vehicle Type", _safe_unique("Vehicle Type"))
-weathers = st.sidebar.multiselect("Weather", _safe_unique("Weather"))
+# City filter
+cities = st.sidebar.multiselect(
+    "Cities",
+    options=_safe_unique("City"),
+    help="Filter by city"
+)
 
+# Vehicle type filter
+vehicles = st.sidebar.multiselect(
+    "Vehicle Type",
+    options=_safe_unique("Vehicle Type"),
+    help="Filter by vehicle type"
+)
+
+# Weather filter
+weathers = st.sidebar.multiselect(
+    "Weather Conditions",
+    options=_safe_unique("Weather"),
+    help="Filter by weather"
+)
+
+# Apply filters
 mask = pd.Series(True, index=df.index)
 if cities and "City" in df.columns:
     mask &= df["City"].isin(cities)
@@ -77,70 +244,169 @@ if vehicles and "Vehicle Type" in df.columns:
 if weathers and "Weather" in df.columns:
     mask &= df["Weather"].isin(weathers)
 
-df = df[mask].reset_index(drop=True)
+df_filtered = df[mask].reset_index(drop=True)
 
-if df.empty:
-    st.warning("No data after filters. Clear filters to continue.")
+if df_filtered.empty:
+    st.warning("⚠️ No data matches the selected filters. Please adjust your filters.")
     st.stop()
 
-# --- Playback state ---
+# Show filter results
+if len(df_filtered) < len(df):
+    st.sidebar.info(f"Showing {len(df_filtered):,} of {len(df):,} records")
+
+
+# ===== PLAYBACK STATE =====
 if "idx" not in st.session_state:
     st.session_state.idx = 0
 if "paused" not in st.session_state:
+    st.session_state.paused = not auto_refresh
+if "last_update" not in st.session_state:
+    st.session_state.last_update = time.time()
+
+# Clamp idx within bounds
+st.session_state.idx = int(max(0, min(st.session_state.idx, len(df_filtered) - 1)))
+
+
+# ===== PLAYBACK CONTROLS =====
+st.subheader("🎮 Playback Controls")
+col1, col2, col3, col4 = st.columns(4)
+
+if col1.button("▶️ Play", use_container_width=True):
     st.session_state.paused = False
 
-# Clamp idx within bounds if filters changed
-st.session_state.idx = int(max(0, min(st.session_state.idx, len(df) - 1)))
-
-col1, col2, col3 = st.columns(3)
-if col1.button("▶️ Play"):
-    st.session_state.paused = False
-if col2.button("⏸️ Pause"):
+if col2.button("⏸️ Pause", use_container_width=True):
     st.session_state.paused = True
-if col3.button("⏮️ Reset"):
+
+if col3.button("⏮️ Reset", use_container_width=True):
     st.session_state.idx = 0
 
-# --- Windowing ---
-def get_window(i: int):
-    # Use iloc (positional) to avoid KeyError when index labels are not 0..n-1
-    current_ts = df.iloc[i]["timestamp"]
+if col4.button("⏭️ Skip Forward", use_container_width=True):
+    st.session_state.idx = min(st.session_state.idx + 100, len(df_filtered) - 1)
+
+# Progress bar
+progress = st.session_state.idx / max(len(df_filtered) - 1, 1)
+st.progress(progress)
+st.caption(f"Progress: {st.session_state.idx + 1:,} / {len(df_filtered):,} records ({progress*100:.1f}%)")
+
+
+# ===== TIME WINDOW =====
+def get_window(i: int) -> Tuple[pd.DataFrame, pd.Timestamp]:
+    """Get data window for current index"""
+    current_ts = df_filtered.iloc[i]["timestamp"]
     window_start = current_ts - pd.Timedelta(minutes=window_minutes)
-    view = df[(df["timestamp"] >= window_start) & (df["timestamp"] <= current_ts)]
+    view = df_filtered[
+        (df_filtered["timestamp"] >= window_start) & 
+        (df_filtered["timestamp"] <= current_ts)
+    ]
     return view, current_ts
 
-view, now = get_window(st.session_state.idx)
+view, current_time = get_window(st.session_state.idx)
 
-# --- KPIs (compute only if columns exist) ---
-k1, k2, k3 = st.columns(3)
-avg_speed = f"{view['Speed'].mean():.1f}" if "Speed" in view.columns else "–"
-k1.metric("Avg Speed", avg_speed)
 
-cong = f"{view['Congestion Score'].mean():.1f}/100" if "Congestion Score" in view.columns else "–"
-k2.metric("Congestion", cong)
+# ===== KPI METRICS =====
+st.subheader("📊 Key Performance Indicators")
+st.caption(f"**Current Time:** {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-events = int(view["Random Event Occurred"].sum()) if "Random Event Occurred" in view.columns else 0
-k3.metric("Events", events)
+kpi1, kpi2, kpi3, kpi4 = st.columns(4)
 
-# --- Charts (guard for missing columns) ---
-st.subheader(f"Timeline up to: {now}")
-
-if "Speed" in view.columns:
-    st.line_chart(view.set_index("timestamp")["Speed"])
+# Average Speed
+if "Speed" in view.columns and len(view) > 0:
+    avg_speed = view["Speed"].mean()
+    kpi1.metric(
+        "Average Speed",
+        f"{avg_speed:.1f} km/h",
+        delta=None
+    )
 else:
-    st.info("Speed column not found — skipping speed chart.")
+    kpi1.metric("Average Speed", "–")
 
-if "Traffic Density" in view.columns:
-    st.line_chart(view.set_index("timestamp")["Traffic Density"])
+# Congestion Score
+if "Congestion Score" in view.columns and len(view) > 0:
+    avg_congestion = view["Congestion Score"].mean()
+    kpi2.metric(
+        "Congestion Level",
+        f"{avg_congestion:.1f}/100",
+        delta=None
+    )
 else:
-    st.info("Traffic Density column not found — skipping density chart.")
+    kpi2.metric("Congestion Level", "–")
 
-st.dataframe(view.tail(50))
+# Random Events
+if "Random Event Occurred" in view.columns:
+    event_count = int(view["Random Event Occurred"].sum())
+    kpi3.metric("Events", event_count)
+else:
+    kpi3.metric("Events", "–")
 
-# --- Advance frame ---
-if not st.session_state.paused:
-    st.session_state.idx = min(st.session_state.idx + speed_mult, len(df) - 1)
-    time.sleep(0.5)
-    try:
+# Traffic Density
+if "Traffic Density" in view.columns and len(view) > 0:
+    avg_density = view["Traffic Density"].mean()
+    kpi4.metric(
+        "Avg Density",
+        f"{avg_density:.2f}",
+        delta=None
+    )
+else:
+    kpi4.metric("Avg Density", "–")
+
+
+# ===== CHARTS =====
+st.subheader("📈 Traffic Analytics")
+
+# Speed over time
+if "Speed" in view.columns and len(view) > 0:
+    st.markdown("**Speed Over Time**")
+    chart_data = view.set_index("timestamp")[["Speed"]]
+    st.line_chart(chart_data, use_container_width=True)
+else:
+    st.info("Speed data not available")
+
+# Traffic Density over time
+if "Traffic Density" in view.columns and len(view) > 0:
+    st.markdown("**Traffic Density Over Time**")
+    chart_data = view.set_index("timestamp")[["Traffic Density"]]
+    st.line_chart(chart_data, use_container_width=True)
+else:
+    st.info("Traffic Density data not available")
+
+# Congestion Score over time
+if "Congestion Score" in view.columns and len(view) > 0:
+    st.markdown("**Congestion Score Over Time**")
+    chart_data = view.set_index("timestamp")[["Congestion Score"]]
+    st.area_chart(chart_data, use_container_width=True)
+
+
+# ===== DATA TABLE =====
+st.subheader("📋 Recent Data")
+display_columns = [col for col in view.columns if col in [
+    "timestamp", "City", "Vehicle Type", "Speed", 
+    "Traffic Density", "Congestion Score", "Weather", "Random Event Occurred"
+]]
+
+if display_columns:
+    st.dataframe(
+        view[display_columns].tail(50),
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.dataframe(view.tail(50), use_container_width=True)
+
+
+# ===== AUTO-ADVANCE LOGIC =====
+if not st.session_state.paused and st.session_state.idx < len(df_filtered) - 1:
+    # Throttle updates to avoid overwhelming the browser
+    current_time_check = time.time()
+    if current_time_check - st.session_state.last_update > 0.3:
+        st.session_state.idx = min(st.session_state.idx + speed_mult, len(df_filtered) - 1)
+        st.session_state.last_update = current_time_check
+        time.sleep(0.1)
         st.rerun()
-    except Exception:
-        st.experimental_rerun()
+elif st.session_state.idx >= len(df_filtered) - 1:
+    st.sidebar.success("✅ Reached end of timeline")
+    st.session_state.paused = True
+
+
+# ===== FOOTER =====
+st.sidebar.markdown("---")
+st.sidebar.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
