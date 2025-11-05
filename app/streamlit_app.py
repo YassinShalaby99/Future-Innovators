@@ -9,6 +9,7 @@ from io import BytesIO
 from datetime import datetime
 import pyarrow.parquet as pq
 from typing import Tuple, Optional
+from streamlit_autorefresh import st_autorefresh
 
 # Optional import (only used if you provide account+key secrets)
 try:
@@ -393,18 +394,15 @@ else:
     st.dataframe(view.tail(50), use_container_width=True)
 
 
-# ===== AUTO-ADVANCE LOGIC =====
+# ===== AUTO-ADVANCE LOGIC (non-blocking, health-check friendly) =====
 if not st.session_state.paused and st.session_state.idx < len(df_filtered) - 1:
-    # Throttle updates to avoid overwhelming the browser
-    current_time_check = time.time()
-    if current_time_check - st.session_state.last_update > 0.3:
-        st.session_state.idx = min(st.session_state.idx + speed_mult, len(df_filtered) - 1)
-        st.session_state.last_update = current_time_check
-        time.sleep(0.1)
-        st.rerun()
+    # Trigger a gentle rerun every 300 ms only while "playing"
+    st_autorefresh(interval=300, key="player-refresh")
+    st.session_state.idx = min(st.session_state.idx + speed_mult, len(df_filtered) - 1)
 elif st.session_state.idx >= len(df_filtered) - 1:
     st.sidebar.success("✅ Reached end of timeline")
     st.session_state.paused = True
+
 
 
 # ===== FOOTER =====
