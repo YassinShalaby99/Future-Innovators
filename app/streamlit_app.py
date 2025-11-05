@@ -284,6 +284,10 @@ if col3.button("⏮️ Reset", use_container_width=True):
 if col4.button("⏭️ Skip Forward", use_container_width=True):
     st.session_state.idx = min(st.session_state.idx + 100, len(df_filtered) - 1)
 
+# --- init once ---
+if "last_update" not in st.session_state:
+    st.session_state.last_update = 0.0
+
 # Progress bar
 progress = st.session_state.idx / max(len(df_filtered) - 1, 1)
 st.progress(progress)
@@ -394,14 +398,14 @@ else:
     st.dataframe(view.tail(50), use_container_width=True)
 
 
-# ===== AUTO-ADVANCE LOGIC (non-blocking, health-check friendly) =====
-if not st.session_state.paused and st.session_state.idx < len(df_filtered) - 1:
-    # Trigger a gentle rerun every 300 ms only while "playing"
-    st_autorefresh(interval=300, key="player-refresh")
-    st.session_state.idx = min(st.session_state.idx + speed_mult, len(df_filtered) - 1)
-elif st.session_state.idx >= len(df_filtered) - 1:
+# ===== AUTO-ADVANCE LOGIC (non-blocking) =====
+if not st.session_state.paused and len(df) > 0 and st.session_state.idx < len(df) - 1:
+    st_autorefresh(interval=400, key="player-refresh")
+    st.session_state.idx = min(st.session_state.idx + speed_mult, len(df) - 1)
+elif len(df) > 0 and st.session_state.idx >= len(df) - 1:
     st.sidebar.success("✅ Reached end of timeline")
     st.session_state.paused = True
+
 
 
 
