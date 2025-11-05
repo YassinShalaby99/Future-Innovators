@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .env
+*.env
 *.egg-info/
 dist/
 build/
@@ -22,3 +23,6 @@ data/*
 # Parquet/CSV anywhere (safety)
 *.parquet
 *.csv
+
+# Secrets File
+.streamlit/secrets.toml
