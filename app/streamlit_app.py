@@ -259,10 +259,14 @@ if len(df_filtered) < len(df):
 # ===== PLAYBACK STATE =====
 if "idx" not in st.session_state:
     st.session_state.idx = 0
+
 if "paused" not in st.session_state:
-    st.session_state.paused = not auto_refresh
-if "last_update" not in st.session_state:
-    st.session_state.last_update = time.time()
+    st.session_state.paused = not auto_refresh  # keep your original logic
+
+# Safe boot — make sure app renders *once* before auto-play starts
+if "booted" not in st.session_state:
+    st.session_state.booted = True
+    st.session_state.paused = True
 
 # Clamp idx within bounds
 st.session_state.idx = int(max(0, min(st.session_state.idx, len(df_filtered) - 1)))
@@ -399,10 +403,13 @@ else:
 
 
 # ===== AUTO-ADVANCE LOGIC (non-blocking) =====
-if not st.session_state.paused and len(df) > 0 and st.session_state.idx < len(df) - 1:
-    st_autorefresh(interval=400, key="player-refresh")
+has_rows = len(df) > 0
+
+if not st.session_state.paused and has_rows and st.session_state.idx < len(df) - 1:
+    # gentle refresh every 1000 ms to keep CPU low on Streamlit Cloud
+    st_autorefresh(interval=1000, key="player-refresh")
     st.session_state.idx = min(st.session_state.idx + speed_mult, len(df) - 1)
-elif len(df) > 0 and st.session_state.idx >= len(df) - 1:
+elif has_rows and st.session_state.idx >= len(df) - 1:
     st.sidebar.success("✅ Reached end of timeline")
     st.session_state.paused = True
 
