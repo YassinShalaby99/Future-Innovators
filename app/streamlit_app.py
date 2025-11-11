@@ -7,28 +7,24 @@ import io
 import json
 import time
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Optional scientific/ML/vis libs — all are lightweight enough for Streamlit Cloud
 import plotly.express as px
 import plotly.graph_objects as go
 import pydeck as pdk
 
-# ML (kept simple/on-demand to avoid heavy cold-starts)
 from sklearn.ensemble import IsolationForest, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
-# Parquet/Arrow support (needed for fast IO + cloud URLs)
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# ------------- App Configuration -------------
 st.set_page_config(
     page_title="Real-Time Traffic Analytics",
     page_icon="🚦",
@@ -36,18 +32,15 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ------------- Constants & Defaults -------------
 DEFAULT_COLUMNS = [
     "timestamp", "road_id", "lat", "lon", 
     "speed_kph", "volume", "occupancy", "direction", "segment_length_km"
 ]
 
-# ----------- Utility: Stable seeded RNG for reproducible demos ----------
 def _np_rng(seed:int=42):
     rng = np.random.RandomState(seed)
     return rng
 
-# ------------- Sidebar: Controls -------------
 with st.sidebar:
     st.title("⚙️ Controls")
     st.write("Choose your live data source and refresh settings.")
@@ -69,12 +62,17 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Tip: Use **Cloud URL** with an Azure Blob SAS or GitHub raw link.")
 
-# ------------- Auto Refresh -------------
+# -------- Auto-refresh (safe) --------
 if refresh_sec > 0:
-    st.experimental_set_query_params(_=int(time.time()))  # avoids caching the URL
-    st.autorefresh = st.experimental_rerun  # alias for clarity
+    now = time.time()
+    if "last_refresh" not in st.session_state:
+        st.session_state.last_refresh = now
+    if now - st.session_state.last_refresh >= refresh_sec:
+        st.session_state.last_refresh = now
+        # bump query params to avoid cached fetches on some hosts
+        st.experimental_set_query_params(_=int(now))
+        st.experimental_rerun()
 
-# ---------- Session State & Caching ----------
 if "buffer" not in st.session_state:
     st.session_state.buffer = pd.DataFrame(columns=DEFAULT_COLUMNS)
 
@@ -90,7 +88,6 @@ def _read_bytes_to_df(b: bytes, file_name: str) -> pd.DataFrame:
         return pd.read_parquet(io.BytesIO(b), engine="pyarrow")
     return pd.read_csv(io.BytesIO(b))
 
-# ----------- Simulated Telemetry Generator -----------
 CITY_CENTERS = {
     "Cairo": (30.0444, 31.2357),
     "Alexandria": (31.2001, 29.9187),
@@ -101,30 +98,21 @@ CITY_CENTERS = {
 def simulate_batch(n:int=1000, city:str="Cairo", seed:int=None) -> pd.DataFrame:
     rng = _np_rng(2025 if seed is None else seed)
     lat0, lon0 = CITY_CENTERS.get(city, CITY_CENTERS["Cairo"])
-
-    # Create pseudo road network
-    road_ids = np.arange(100, 160)  # 60 segments
+    road_ids = np.arange(100, 160)
     dirs = rng.choice(["N", "S", "E", "W"], size=road_ids.size)
     road_dirs = dict(zip(road_ids, dirs))
-
-    # Random picks
     road_pick = rng.choice(road_ids, size=n)
     base_lat = lat0 + rng.randn(n) * 0.05
     base_lon = lon0 + rng.randn(n) * 0.05
-
-    # Traffic signals
     rush = datetime.now().hour in [7,8,9,16,17,18]
     mean_speed = 28 if rush else 55
     speed_kph = np.clip(rng.normal(loc=mean_speed, scale=12, size=n), 3, 110)
     volume = np.clip(rng.normal(loc=60 if rush else 35, scale=15, size=n), 5, 160).astype(int)
     occupancy = np.clip((volume/160) + rng.normal(0.10, 0.05, size=n), 0.01, 0.98)
     seg_len = np.clip(rng.normal(1.2, 0.4, size=n), 0.2, 5.0)
-
-    # Occasional disturbances
     jam_mask = rng.rand(n) < (0.12 if rush else 0.06)
     speed_kph[jam_mask] = np.clip(speed_kph[jam_mask] - rng.rand(jam_mask.sum())*25, 3, None)
     occupancy[jam_mask] = np.clip(occupancy[jam_mask] + rng.rand(jam_mask.sum())*0.25, None, 0.99)
-
     timestamp = pd.to_datetime(datetime.now(timezone.utc)).round("s")
     df = pd.DataFrame({
         "timestamp": pd.date_range(timestamp, periods=n, freq="S"),
@@ -139,7 +127,6 @@ def simulate_batch(n:int=1000, city:str="Cairo", seed:int=None) -> pd.DataFrame:
     })
     return df
 
-# ----------- Data Acquisition -----------
 def acquire_data(source_mode: str) -> Tuple[pd.DataFrame, Optional[str]]:
     try:
         if source_mode == "Simulated Stream":
@@ -154,7 +141,7 @@ def acquire_data(source_mode: str) -> Tuple[pd.DataFrame, Optional[str]]:
             else:
                 st.info("Upload a file to start, or switch to Simulated/Cloud source.")
                 return pd.DataFrame(columns=DEFAULT_COLUMNS), None
-        else:  # Cloud URL
+        else:
             url = st.sidebar.text_input("Enter public URL (CSV/Parquet)", key="cloud_url", value="")
             if not url:
                 st.warning("Provide a URL to fetch data from a cloud location (Azure/GitHub/etc.).")
@@ -165,24 +152,15 @@ def acquire_data(source_mode: str) -> Tuple[pd.DataFrame, Optional[str]]:
         st.exception(e)
         return pd.DataFrame(columns=DEFAULT_COLUMNS), f"Error: {e}"
 
-# ----------- Data Normalization -----------
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=DEFAULT_COLUMNS)
-
-    # Try to map alternative column names
     colmap = {
-        "time": "timestamp",
-        "datetime": "timestamp",
-        "lat": "lat",
-        "latitude": "lat",
-        "lon": "lon",
-        "lng": "lon",
-        "longitude": "lon",
-        "speed": "speed_kph",
-        "speed_km_h": "speed_kph",
-        "count": "volume",
-        "vol": "volume",
+        "time": "timestamp", "datetime": "timestamp",
+        "lat": "lat", "latitude": "lat",
+        "lon": "lon", "lng": "lon", "longitude": "lon",
+        "speed": "speed_kph", "speed_km_h": "speed_kph",
+        "count": "volume", "vol": "volume",
         "occ": "occupancy",
         "dir": "direction",
         "segment_km": "segment_length_km",
@@ -195,8 +173,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         if lc in colmap:
             ren[c] = colmap[lc]
     df = df.rename(columns=ren)
-
-    # Ensure required columns exist
     for c in DEFAULT_COLUMNS:
         if c not in df.columns:
             if c == "timestamp":
@@ -207,22 +183,17 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
                 df[c] = "N"
             elif c == "segment_length_km":
                 df[c] = 1.0
-            else:  # numeric
+            else:
                 df[c] = 0
-
-    # Coerce types
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").fillna(pd.Timestamp.utcnow())
     num_cols = ["speed_kph","volume","occupancy","segment_length_km","lat","lon"]
     for c in num_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["direction"] = df["direction"].astype(str)
     df["road_id"] = df["road_id"].astype(str)
-
-    # Drop obviously broken rows
     df = df.dropna(subset=["lat","lon"])
     return df[DEFAULT_COLUMNS].copy()
 
-# ----------- Buffer Maintenance -----------
 def append_to_buffer(new_df: pd.DataFrame, minutes: int):
     buf = st.session_state.buffer
     st.session_state.buffer = pd.concat([buf, new_df], ignore_index=True)
@@ -230,60 +201,41 @@ def append_to_buffer(new_df: pd.DataFrame, minutes: int):
     st.session_state.buffer = st.session_state.buffer[st.session_state.buffer["timestamp"] >= cutoff]
     st.session_state.buffer.reset_index(drop=True, inplace=True)
 
-# ----------- KPI & Metrics -----------
 def compute_metrics(df: pd.DataFrame, congestion_thr: float) -> dict:
     if df.empty:
-        return {
-            "avg_speed": 0.0,
-            "median_speed": 0.0,
-            "congestion_rate": 0.0,
-            "total_volume": 0,
-            "records": 0,
-        }
+        return {"avg_speed": 0.0,"median_speed": 0.0,"congestion_rate": 0.0,"total_volume": 0,"records": 0}
     avg_speed = float(df["speed_kph"].mean())
     med_speed = float(df["speed_kph"].median())
     congestion_rate = float((df["speed_kph"] <= congestion_thr).mean())
     total_volume = int(df["volume"].sum())
-    return {
-        "avg_speed": round(avg_speed, 2),
-        "median_speed": round(med_speed, 2),
-        "congestion_rate": round(congestion_rate, 3),
-        "total_volume": total_volume,
-        "records": len(df),
-    }
+    return {"avg_speed": round(avg_speed,2),"median_speed": round(med_speed,2),"congestion_rate": round(congestion_rate,3),"total_volume": total_volume,"records": len(df)}
 
-# ----------- ML: Anomaly Detection -----------
 @st.cache_data(show_spinner=False)
 def fit_anomaly_model(df: pd.DataFrame, sensitivity:int=35):
     if df.empty:
         return None
-    # Keep things simple: only use stable numeric features
     feats = df[["speed_kph","volume","occupancy"]].copy()
     feats = feats.fillna(feats.median(numeric_only=True))
-    contamination = max(0.01, min(0.25, sensitivity/200))  # map 1..100 -> ~0.005..0.25
-    model = IsolationForest(
-        n_estimators=150,
-        contamination=contamination,
-        random_state=42
-    )
+    contamination = max(0.01, min(0.25, sensitivity/200))
+    model = IsolationForest(n_estimators=150, contamination=contamination, random_state=42)
     model.fit(feats.values)
     return model
 
 def score_anomalies(df: pd.DataFrame, model) -> pd.DataFrame:
     if model is None or df.empty:
-        df["anomaly"] = False
-        df["anomaly_score"] = 0.0
-        return df
+        out = df.copy()
+        out["anomaly"] = False
+        out["anomaly_score"] = 0.0
+        return out
     feats = df[["speed_kph","volume","occupancy"]].copy()
     feats = feats.fillna(feats.median(numeric_only=True))
     scores = model.decision_function(feats.values)
-    preds = model.predict(feats.values)  # -1 is anomaly
+    preds = model.predict(feats.values)
     out = df.copy()
     out["anomaly_score"] = scores
     out["anomaly"] = preds == -1
     return out
 
-# ----------- ML: ETA Prediction (per segment) -----------
 @st.cache_data(show_spinner=False)
 def fit_eta_model(df: pd.DataFrame):
     if df.empty:
@@ -291,25 +243,21 @@ def fit_eta_model(df: pd.DataFrame):
     work = df.copy()
     work["hour"] = work["timestamp"].dt.hour
     work["wday"] = work["timestamp"].dt.weekday
-    # Target: travel minutes = (segment_km / speed_kph) * 60
     work["travel_min"] = (work["segment_length_km"] / work["speed_kph"].replace(0, np.nan)) * 60
     work = work.replace([np.inf, -np.inf], np.nan).dropna(subset=["travel_min"])
     if work.shape[0] < 200:
         return None
-
     X = work[["volume","occupancy","hour","wday","segment_length_km"]]
     y = work["travel_min"]
-    model = Pipeline([
-        ("scaler", StandardScaler()),
-        ("rf", RandomForestRegressor(n_estimators=200, random_state=42))
-    ])
+    model = Pipeline([("scaler", StandardScaler()),("rf", RandomForestRegressor(n_estimators=200, random_state=42))])
     model.fit(X, y)
     return model
 
 def predict_eta(df: pd.DataFrame, model) -> pd.DataFrame:
     if model is None or df.empty:
-        df["eta_min_pred"] = np.nan
-        return df
+        out = df.copy()
+        out["eta_min_pred"] = np.nan
+        return out
     work = df.copy()
     work["hour"] = work["timestamp"].dt.hour
     work["wday"] = work["timestamp"].dt.weekday
@@ -319,19 +267,22 @@ def predict_eta(df: pd.DataFrame, model) -> pd.DataFrame:
     out["eta_min_pred"] = np.round(preds, 2)
     return out
 
-# ----------- App Header -----------
 st.title("🚦 Real-Time Traffic Analytics")
 st.caption("Enterprise-grade dashboard for live traffic telemetry — ingest, monitor, detect anomalies, and predict travel time.")
 
-# ----------- Acquire & Normalize -----------
 new_batch, source_desc = acquire_data(source)
 new_batch = normalize_df(new_batch)
 if not new_batch.empty:
     append_to_buffer(new_batch, window_minutes)
-
 df = st.session_state.buffer.copy()
 
-# ----------- Status Bar -----------
+# Ensure columns exist when ML toggles are OFF (for tooltips/charts)
+if "anomaly" not in df.columns:
+    df["anomaly"] = False
+    df["anomaly_score"] = 0.0
+if "eta_min_pred" not in df.columns:
+    df["eta_min_pred"] = np.nan
+
 left, mid, right = st.columns([2,2,3])
 with left:
     st.subheader("Status")
@@ -357,7 +308,6 @@ with right:
         csv_bytes = df.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ CSV", csv_bytes, file_name="traffic_snapshot.csv", mime="text/csv")
     with colC:
-        # Write to in-memory parquet
         sink = io.BytesIO()
         table = pa.Table.from_pandas(df)
         pq.write_table(table, sink)
@@ -365,7 +315,6 @@ with right:
 
 st.markdown("---")
 
-# ----------- Anomaly & ETA Sections -----------
 if enable_anomaly_detection:
     with st.spinner("Training anomaly model..."):
         anom_model = fit_anomaly_model(df, anomaly_sensitivity)
@@ -376,7 +325,6 @@ if enable_eta_model:
         eta_model = fit_eta_model(df)
     df = predict_eta(df, eta_model)
 
-# ----------- Alerts -----------
 alerts = []
 if not df.empty:
     if (df["speed_kph"] <= congestion_speed_threshold).mean() > 0.35:
@@ -390,7 +338,6 @@ if alerts:
 else:
     st.success("✅ Network operating within normal parameters.")
 
-# ----------- Map -----------
 st.subheader("Network Map")
 if df.empty:
     st.info("No data available yet.")
@@ -408,7 +355,6 @@ else:
         radius_min_pixels=3,
         radius_max_pixels=20,
         get_fill_color=[
-            # color by congestion/anomaly (red if congested or anomaly)
             "255 * (speed_kph <= %d or anomaly)" % congestion_speed_threshold,
             "140 * (speed_kph > %d and not anomaly)" % congestion_speed_threshold,
             "80"
@@ -422,7 +368,6 @@ else:
     )
     st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip), use_container_width=True)
 
-# ----------- Charts -----------
 st.subheader("KPIs & Trends")
 if not df.empty:
     c1, c2 = st.columns(2)
@@ -448,12 +393,10 @@ if not df.empty:
             fig4 = px.bar(anom, x="road_id", y="anomaly_pct", title="Anomaly % by Segment")
             st.plotly_chart(fig4, use_container_width=True)
 
-# ----------- Data Explorer -----------
 st.subheader("Data Explorer")
 with st.expander("Peek current buffer"):
     st.dataframe(df.head(1000), use_container_width=True)
 
-# ----------- Diagnostics -----------
 st.subheader("Diagnostics")
 diag = {
     "python_version": f"{os.sys.version.split()[0]}",
