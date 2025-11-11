@@ -5,3 +5,6 @@ pyarrow>=12.0.0
 requests>=2.31.0
 streamlit-autorefresh>=1.0
 azure-storage-blob>=12.19.0  # only needed if you choose SDK auth later
+plotly
+pydeck
+scikit-learn
